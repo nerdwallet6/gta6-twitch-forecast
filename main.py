@@ -19,10 +19,19 @@ hardcoded from practice data):
        extrapolation sane for hour-1 counts above the training range
        (a plain linear log-regression collapses there); the dummy adds
        ~+0.3 log units at later hours for rolling-midnight-only launches
-       (regions keep unlocking through the day).
+       (regions keep unlocking through the day).  A is fitted only on
+       comparables with hour-1 >= 10,000: the tiny hour-1 exploders
+       (hour-1 in the hundreds, peak/hour-1 up to 2000x) distort both
+       the ridge fit and the residual spread for the big launches this
+       forecast is about.  Its residual quantiles are kernel-weighted
+       by log(h1) distance to the target, so the spread reflects
+       launches of a similar size, and scaled by 0.85: leave-one-out
+       checks showed the unweighted spread running ~20% wider than the
+       realised error for in-range launches.
     B (60%): local-linear kernel regression in log(h1) (Gaussian
        bandwidth 1.5), with normal quantiles from the weighted residual
-       spread.  This adapts to the curvature locally and falls back to
+       spread, also scaled by 0.85 for the same calibration reason.
+       This adapts to the curvature locally and falls back to
        the nearest comparables outside the training range.
   The target's rolling-only flag is read from the target-named
   comparable's unlock text, else from the case notes, else the training
@@ -52,6 +61,9 @@ BW = 1.5            # kernel bandwidth in log(h1) for component B
 RIDGE = 1.0         # ridge penalty for component A (not on the intercept)
 W_A = 0.4           # ensemble weight of component A (log space)
 W_B = 0.6           # ensemble weight of component B (log space)
+A_MIN_H1 = 10000.0  # component A trains only on comparables this big
+QSCALE = 0.85       # spread calibration for component A's quantiles
+B_SIGMA_MULT = 0.85  # spread calibration for component B's sigma
 X_CENTER = 11.0     # centre for the quadratic log(h1) term
 X_PAD = 1.0         # allowed extrapolation beyond the training log(h1) range
 SIGMA_FLOOR = 0.15  # minimum log-spread for component B
@@ -152,6 +164,37 @@ def empirical_offsets(residuals):
     return offsets
 
 
+def weighted_offsets(values, weights):
+    """Interpolated weighted quantiles of values at LEVELS.
+
+    Sorts by value and walks the cumulative weight; interpolates
+    between neighbouring values when the target cumulative weight
+    falls between them.  With equal weights this is the same
+    interpolation as empirical_offsets up to the usual off-by-half
+    convention, which is immaterial at these sample sizes.
+    """
+    pairs = sorted(zip(values, weights))
+    total = sum(weights)
+    offsets = []
+    for tau in LEVELS:
+        target = tau * total
+        acc = 0.0
+        prev = None
+        found = pairs[-1][0]
+        for value, w in pairs:
+            if acc + w >= target:
+                if prev is None:
+                    found = value
+                else:
+                    frac = (target - acc) / w if w > 0.0 else 0.0
+                    found = prev * (1.0 - frac) + value * frac
+                break
+            acc += w
+            prev = value
+        offsets.append(found)
+    return offsets
+
+
 # ------------------------------------------------------- unlock classification
 
 _NEG_WORDS = ("no", "not", "without", "never", "n't")
@@ -228,6 +271,7 @@ def extract_curves(case):
         cls = classify_unlock(comp.get("unlock"))
         rows.append({
             "x": safe_log(by_hour[1]),
+            "v1": by_hour[1],
             "roll": 1.0 if cls == "rollonly" else 0.0,
             "y": [safe_log(by_hour[h]) for h in range(1, 25)],
         })
@@ -281,24 +325,34 @@ def hour_one_print(case):
 # ------------------------------------------------------------------ components
 
 def component_a(rows, tx, troll):
-    """Per-hour ridge on [1, x, (x-11)^2, roll]; empirical residual quantiles.
+    """Per-hour ridge on [1, x, (x-11)^2, roll]; kernel-weighted residual
+    quantiles, calibrated by QSCALE.
+
+    Fitted only on comparables with hour-1 >= A_MIN_H1 (the tiny
+    hour-1 exploders distort the fit and the spread for big launches);
+    falls back to all rows if that leaves too few.  Residual quantiles
+    are weighted by Gaussian kernel distance in log(h1) to the target,
+    so the spread reflects similarly-sized launches.
 
     Returns {hour: [5 log-quantiles]} with medians and offsets smoothed
     across neighbouring hours.
     """
-    feats = [[1.0, r["x"], (r["x"] - X_CENTER) ** 2, r["roll"]] for r in rows]
+    big = [r for r in rows if r.get("v1", 0.0) >= A_MIN_H1]
+    use = big if len(big) >= 5 else rows
+    weights = [math.exp(-0.5 * ((r["x"] - tx) / BW) ** 2) for r in use]
+    feats = [[1.0, r["x"], (r["x"] - X_CENTER) ** 2, r["roll"]] for r in use]
     target_feat = [1.0, tx, (tx - X_CENTER) ** 2, troll]
     medians = []
     offsets = [[] for _ in LEVELS]
     for hour in HOURS:
-        ys = [r["y"][hour - 1] for r in rows]
+        ys = [r["y"][hour - 1] for r in use]
         beta = ridge_fit(feats, ys, RIDGE)
         mu = sum(b * f for b, f in zip(beta, target_feat))
         residuals = [y - sum(b * f for b, f in zip(beta, feat))
                      for y, feat in zip(ys, feats)]
         medians.append(mu)
-        for k, off in enumerate(empirical_offsets(residuals)):
-            offsets[k].append(off)
+        for k, off in enumerate(weighted_offsets(residuals, weights)):
+            offsets[k].append(off * QSCALE)
     medians = smooth_seq(medians)
     offsets = [smooth_seq(seq) for seq in offsets]
     return {h: [medians[i] + offsets[k][i] for k in range(len(LEVELS))]
@@ -323,7 +377,7 @@ def component_b(rows, tx):
         mean_res = sum(w * e for w, e in zip(weights, residuals)) / total_w
         var = sum(w * (e - mean_res) ** 2
                   for w, e in zip(weights, residuals)) / total_w
-        sigma = max(math.sqrt(max(var, 0.0)), SIGMA_FLOOR)
+        sigma = max(math.sqrt(max(var, 0.0)) * B_SIGMA_MULT, SIGMA_FLOOR)
         out[hour] = [mu + z * sigma for z in Z]
     return out
 
