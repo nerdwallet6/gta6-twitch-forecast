@@ -27,6 +27,10 @@ hardcoded from practice data):
   The target's rolling-only flag is read from the target-named
   comparable's unlock text, else from the case notes, else the training
   mean.  The effective log(h1) is clamped to the training range +- 1.
+  When the target's log(h1) lies outside the training range, the
+  forecast spread widens in proportion to the distance (the median is
+  untouched): a launch bigger than any comparable is an extrapolation,
+  and the quantiles say so honestly.
   Any failure falls back to the house-style forecast (hour-1 print with
   a spread widening over the day), so output is always valid.
 
@@ -51,6 +55,8 @@ W_B = 0.6           # ensemble weight of component B (log space)
 X_CENTER = 11.0     # centre for the quadratic log(h1) term
 X_PAD = 1.0         # allowed extrapolation beyond the training log(h1) range
 SIGMA_FLOOR = 0.15  # minimum log-spread for component B
+EXTRA_SPREAD = 0.25  # extra log-spread per log-unit the target sits outside
+                     # the training log(h1) range (extrapolation honesty)
 LOG_Q_MIN = -10.0   # exp() of this is ~4.5e-5, safely above 0
 LOG_Q_MAX = 20.72326583694641  # ln(1e9)
 
@@ -340,13 +346,22 @@ def forecast_case(case):
         else:
             xs = [r["x"] for r in rows]
             lo, hi = min(xs) - X_PAD, max(xs) + X_PAD
-            tx = min(max(safe_log(p), lo), hi)
+            raw_x = safe_log(p)
+            tx = min(max(raw_x, lo), hi)
             troll = target_roll(case, rows)
             qa = component_a(rows, tx, troll)
             qb = component_b(rows, tx)
+            # Widen the spread when the target sits outside the training
+            # range: above the largest comparable hour-1 (a GTA-scale
+            # launch) the shape is an extrapolation judgement, not
+            # evidence, so the quantiles honestly widen with the
+            # distance.  The median (Z = 0) is untouched.
+            extrap = (max(0.0, raw_x - max(xs))
+                      + max(0.0, min(xs) - raw_x))
             log_q = {}
             for h in HOURS:
                 log_q[h] = [W_A * qa[h][k] + W_B * qb[h][k]
+                            + Z[k] * EXTRA_SPREAD * extrap
                             for k in range(len(LEVELS))]
     except Exception:
         try:
